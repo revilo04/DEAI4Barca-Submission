@@ -1,286 +1,161 @@
-# Football Tracking Challenge – Possession Detection
+# Football Tracking Challenge – Possession Detection (`DEAI4Barca`)
 
 ## 1. Project Overview
 
-This project aims to reconstruct ball possession from football tracking data, as part of a challenge involving player and ball tracking information.
+This repository contains our end-to-end machine learning pipeline for reconstructing frame-level ball possession from football player and ball tracking data (`BAR-ATH` match).
 
-The objective is to assign a label to every video frame, identifying whether:
+The objective is to assign a state label to every video frame (`0..199,318` at **25 FPS**):
+- **`H`** – Home team (FC Barcelona) has possession.
+- **`A`** – Away team (Athletic Club) has possession.
+- **`D`** – Dead ball / play is paused (throw-in, free kick, corner, goal kick, kickoff, foul, offside, etc.).
+- **`X`** – Frame is outside the graded playing periods (pre-match, half-time, post-match).
 
-- **H** – The home team has possession.
-- **A** – The away team has possession.
-- **D** – The ball is dead (e.g. throw-in, corner, free kick, goal kick, kickoff, or another interruption).
-- **X** – The frame is outside the evaluated playing periods or cannot be assigned to one of the other states.
+### Core Challenges & Our Solution
+In the target `BAR-ATH` tactical tracking dataset, ground-truth labels are held out for evaluation, and the ball is only detected in **~56.9%** of frames (with non-extrapolated player dropouts and frequent track ID reassignments).
 
-The main difficulty is that possession is not explicitly provided by the tracking data. It must be inferred from the positions and movements of the ball and players, together with additional event information.
-
-Importantly, the ball is not visible in every frame. Therefore, the pipeline cannot rely exclusively on ball tracking or detected touches.
-
-The project combines:
-1. Player and ball tracking data.
-2. Smart Tagging information.
-3. Ball movement and player proximity.
-4. Detected touch events.
-5. A state-based approach to reconstruct possession over time.
-
-The current implementation is a working baseline intended to be further improved.
+To overcome this without relying on brittle hand-crafted heuristics, we built a **supervised transfer-learning pipeline**:
+1. **External Training Data (SkillCorner Open Data):** Automatically downloads and harmonizes **20 full broadcast-tracked matches** from the SkillCorner Open Data repository into our normalized 25 FPS, 46-slot tracking format.
+2. **Rich Spatio-Temporal Feature Engineering (265 Features):** Extracts ball kinematics, gap-bridging features across ball-visibility dropouts, team collective shape/pressure, inferred touch dynamics, and multi-scale rolling/lag/lead temporal context.
+3. **Symmetric Data Augmentation (`swap_teams`):** Doubles the training set to **945,714 rows** while guaranteeing zero home/away bias by mirroring team-relative features and flipping labels (`H` <-> `A`).
+4. **Gradient Boosted Decision Trees (`HistGradientBoostingClassifier`):** Natively handles `NaN` values during ball dropouts and learns complex interactions between player collective movement and ball kinematics.
+5. **Temporal Probability Smoothing & Domain Post-Processing:** Smooths predicted class probabilities over a **4.0-second** centred window (selected on held-out validation matches to maximize **Spell F1**) and enforces the graded second-half pre-kickoff dead-ball window.
 
 ---
 
-## 2. Data
+## 2. Repository Structure
 
-The tracking dataset contains **199,319 frames**, with a frame rate of **25 FPS**.
+```text
+DEAI4Barca-Submission/
+├── main.py                                    # Root entry point (runs the full pipeline)
+├── DEAI4BARCA.csv                             # Final generated submission file (official name)
+├── submission.csv                             # Final generated submission file (default output)
+├── DEAI4Barca.pdf                             # Technical report
+├── games.py                                   # Match metadata, frame block definitions, and asset paths
+├── pyproject.toml / uv.lock                   # Dependencies and reproducible environment lockfile
+├── data/
+│   ├── README.md                              # Dataset placement documentation
+│   └── derived/possession_model_tuning/
+│       ├── best_config.json                   # Saved hyperparameters and optimal smoothing window (4.0s)
+│       └── final_model.joblib                 # Pre-trained 20-match HistGradientBoostingClassifier
+├── src_model/
+│   ├── main.py                                # Core pipeline orchestration
+│   ├── constants.py                           # Match frame boundaries and root path definitions
+│   └── pipeline/
+│       ├── skillcorner/
+│       │   ├── constants.py                   # SkillCorner resampling and filtering constants
+│       │   ├── get_data.py                    # Automatic downloader for 20 SkillCorner matches
+│       │   ├── format_data.py                 # Coordinate normalization, 10->25 FPS resampling, label builder
+│       │   └── utils.py                       # File path helpers
+│       └── model/
+│           ├── constants.py                   # Model hyperparameters, sampling rate, and window constants
+│           ├── match_input.py                 # Unified MatchInput wrapper for SkillCorner and BAR-ATH
+│           ├── features.py                    # 265 spatio-temporal features & swap_teams augmentation
+│           ├── dataset.py                     # Match-level train/validation split and row subsampling
+│           ├── tuning.py                      # Hyperparameter & smoothing window selection via Spell F1
+│           ├── train.py                       # Model training, checkpoint caching, and reloading
+│           └── predict.py                     # Frame-level probability prediction and temporal smoothing
+├── starter/                                   # Provided baseline utilities and EPTS/XML loaders
+├── evaluation/                                # Official validation and scoring scripts
+└── info/                                      # Challenge documentation (CHALLENGE.md, DATA.md, FAQ.md)
+```
 
-The available information includes:
-- Ball coordinates.
-- Player coordinates.
-- Player team identification.
-- Ball and player movement information derived from tracking.
-- Smart Tagging events.
-- Detected ball-touch events.
+---
 
-The ball is visible in approximately **56.9% of all frames**. This is one of the main challenges of the task.
+## 3. Quick Start & Reproduction
 
-### Evaluated periods
+### Prerequisites
+- Python **3.12+**
+- Required BAR-ATH match tracking files placed in `data/tactical/` (`BAR-ATH_tactical_atd.txt`, `BAR-ATH_tactical_atd.xml`).
 
-The pipeline distinguishes between the following periods:
+### Installation
+Using `uv` (recommended) or `pip`:
+```bash
+# Option A: Using uv
+uv sync
 
-| Period | Start frame | End frame |
-|---|---:|---:|
+# Option B: Using standard pip / venv
+pip install joblib "kloppy==3.18.0" numpy pandas scikit-learn
+```
+
+### Running the Pipeline
+Execute `main.py` from the repository root:
+```bash
+python main.py
+```
+
+### What `python main.py` Does:
+1. **SkillCorner Data Preparation:** Checks `data/external/skillcorner/` for the 20 training matches (downloading any missing files automatically) and resamples them from 10 FPS to 25 FPS (caching converted matches in `data/derived/skillcorner/`).
+2. **Pre-Trained Model Loading:** Because `data/derived/possession_model_tuning/best_config.json` and `final_model.joblib` are included in the repository (`RESUME_SAVED_MODELS = True` and `USE_SAVED_TUNING_RESULT = True`), the pipeline verifies the configuration signature and **loads the pre-trained model directly** in ~18 seconds without re-running the full training loop.
+   - *Note:* If `final_model.joblib` is deleted, `python main.py` will automatically re-train the model from scratch on all 20 SkillCorner matches and save the new artifact.
+3. **BAR-ATH Prediction & Post-Processing:** Computes the 265 features on `BAR-ATH`, applies 4.0-second probability smoothing, enforces the second-half pre-kickoff dead-ball rule (`frames 110,808..113,741`), and writes `submission.csv`.
+
+### Validating & Evaluating the Submission
+```bash
+# 1. Verify submission format and frame coverage
+python evaluation/validate_submission.py DEAI4BARCA.csv
+
+# 2. Score against public ground truth
+cp DEAI4BARCA.csv evaluation/results/our_submission.csv
+python evaluation/run_evaluation.py --no-detail
+rm evaluation/results/our_submission.csv
+```
+
+---
+
+## 4. Methodology & Pipeline Architecture
+
+### 4.1 Cross-Dataset Harmonization (`src_model/pipeline/skillcorner/`)
+To train a supervised model that generalizes to `BAR-ATH`, we align SkillCorner's open tracking data with the target Metrica EPTS format:
+- **Spatial Normalization:** SkillCorner pitch coordinates (centred at `(0, 0)` in metres) are scaled by match-specific pitch dimensions and shifted to `[0, 1] x [0, 1]`. Attacking directions are standardized per half so features are invariant to which side a team defends.
+- **Temporal Resampling (10 FPS -> 25 FPS):** Player and ball coordinates are linearly interpolated to 25 FPS (`resample_match`), and velocities are recomputed in metres per second.
+- **Detection Filtering:** Only detected ball and player observations (`is_detected == True`) are retained (`BALL_DETECTED_ONLY = True`, `PLAYERS_DETECTED_ONLY = True`) so the model experiences realistic visibility dropouts similar to `BAR-ATH`.
+- **Ground-Truth Label Construction:** Frame labels (`H`, `A`, `D`, `X`) are synthesized from SkillCorner's `phases_of_play.csv` and per-frame `possession.group` annotations.
+
+### 4.2 Spatio-Temporal Feature Engineering (`src_model/pipeline/model/features.py`)
+For every frame, `build_features()` constructs **265 `float32` features** organized into six functional blocks:
+
+1. **Ball Kinematics & Geometry (`ball_block`):**
+   - Visibility indicator (`ball_seen`), normalized forward progression (`ball_fwd`), distance to touchlines, goal lines, and nearest goal, penalty-box presence (`ball_in_box`), out-of-bounds margin (`ball_out_margin`).
+   - Incoming/outgoing speed (`0.2s` window), speed change, acceleration (`ball_accel`), turn angle (`ball_turn_deg`), cumulative displacement over `1s` and `3s`, and continuous stationary duration (`ball_still_s`).
+2. **Visibility Gap Bridging (`gap_block`):**
+   - Explicitly models periods when the ball disappears (`~43.1%` of frames in `BAR-ATH`): duration of the current invisibility gap (`gap_len_s`), relative position within the gap (`gap_position`), spatial jump distance between last-seen and next-seen coordinates (`gap_jump`), and boundary/speed/proximity states immediately before (`gap_prev_*`) and after (`gap_next_*`) the dropout.
+3. **Nearest-Player & On-Ball Interaction (`touch_block`):**
+   - Distance, speed, relative velocity, and velocity cosine alignment (`nearest_alignment`) of the closest player to the ball, plus persistence duration (`nearest_persistence_s`).
+   - Inferred `on_ball` (player within `2.0m`) and kinematic `touch` events (player within `2.0m` coinciding with a ball turn >= 20 deg or speed change >= 2.0 m/s), including time elapsed since (`since_touch`) and until (`until_touch`) the nearest touch and rolling touch counts over +/- 3s.
+4. **Team-Relative Proximity, Pressure & Collective Shape (`team_block`):**
+   - Computed symmetrically from each team's perspective: nearest, second-nearest, and mean top-3 player distances to the ball; player counts within `2m`, `3m`, `5m`, `10m`, and `20m`; defensive pressure count (`opponents within 3.0m` of the ball-carrier).
+   - **Ball-independent collective geometry** (crucial when the ball is invisible): defensive line (`defline`), attacking line (`topline`), team length, width, compactness, forward collective velocity (`vel_attack`), share of slow/walking players (`< 1.0 m/s`, highly indicative of dead balls `D`), players per pitch third, and players inside own/opponent penalty boxes.
+5. **Cross-Team Differentials (`both_teams_block`):**
+   - Explicit `home_minus_away_*` differentials across nearest distances, pressure, collective forward velocity, defensive/attacking lines, compactness, and touch recency, plus overall speed quantiles (`q20`, `q80`) and centroid separation.
+6. **Multi-Scale Temporal Context (`add_time_context` & `add_past_future_context`):**
+   - Centred rolling means over **1s** and **4s** windows (`_r1s`, `_r4s`).
+   - Exact lead/lag shifts at **+/- 1s** (`_m1s`, `_p1s`).
+   - Past-only (`_past2s`, `_past6s`), future-only (`_next2s`, `_next6s`), and regime-change differences (`_change2s`, `_change6s`) over **2s** and **6s** windows.
+
+### 4.3 Symmetric Augmentation & Model Training (`dataset.py`, `train.py`, `tuning.py`)
+- **Match Split & Subsampling:** The 20 SkillCorner matches are split at the match level into **16 training matches** and **4 held-out validation matches**. Training frames are sampled every 5th graded frame (`SAMPLE_EVERY = 5`, i.e., `0.2s` intervals) to reduce redundant adjacent frames.
+- **Team-Swap Augmentation (`swap_teams`):** Every sampled training frame is duplicated with Home and Away roles exchanged (`home_*` <-> `away_*`, `home_minus_away_*` negated, `_fwd` coordinates inverted to `1 - x`, and labels `H` <-> `A`). This produces **945,714 training rows** and guarantees exact symmetry between Home and Away predictions.
+- **Classifier:** `HistGradientBoostingClassifier` (`max_iter=300`, `learning_rate=0.1`, `max_leaf_nodes=31`, `min_samples_leaf=200`, `l2_regularization=1.0`).
+- **Smoothing Selection & Post-Processing:** On the 4 held-out matches (evaluated across all frames without subsampling), predicted probabilities are smoothed with a centred rolling average across candidate windows `(0, 1, 2, 4, 8)` seconds. A **4.0-second window** achieves the highest held-out **Spell F1 (`0.456`)** alongside **Macro F1 (`0.868`)**. The final model is then fit on all 20 matches.
+
+### 4.4 Domain Post-Processing on `BAR-ATH`
+1. **Graded Period Masking:** Frames outside the official half intervals (`11,185..90,651` and `110,808..190,197`) are assigned `X`.
+2. **Pre-Kickoff Dead Ball Rule:** As noted in `info/FAQ.md`, the second half is graded starting at frame `110,808`, whereas the actual kickoff occurs at frame `113,742`. `mark_pre_kickoff_dead_ball()` deterministically assigns `D` to `[110,808, 113,742)`.
+
+---
+
+## 5. Final Output Summary (`DEAI4BARCA.csv` / `submission.csv`)
+
+| Period | Start Frame | End Frame |
+| :--- | ---: | ---: |
 | First half | 11,185 | 90,651 |
-| Second-half pre-kickoff | 110,808 | 113,741 |
+| Second-half pre-kickoff (`D`) | 110,808 | 113,741 |
 | Second half | 113,742 | 190,197 |
 
-The first and second halves are treated separately. Frames outside the relevant playing periods are not considered active-play possession frames.
-
-The second-half pre-kickoff interval is explicitly labelled as dead ball (`D`).
-
----
-
-## 3. Project Structure
-
-The project is organised into four Jupyter notebooks, each covering a different stage of the possession reconstruction pipeline.
-
-| Notebook | Description |
-|---|---|
-| `pauses_analysis.ipynb` | Analyses Smart Tagging information and tracking data to identify pauses in play. Produces pause episodes and frame-level pause labels (`D`, `H`, `A`, `X`). |
-| `frame_features.ipynb` | Processes the raw tracking data and computes the features used throughout the project, including ball and player positions, velocities, distances and proximity indicators. |
-| `merge_labels.ipynb` | Combines pause labels and possession labels into the final frame-level prediction used for evaluation. |
-| `possession_video.ipynb` | Detects ball touches and restarts, combines tracking evidence with touch events, and reconstructs team possession frame by frame. |
-
-### Supporting files and outputs
-
-- `touch_events_v3.csv`: input file containing the detected touch events used by the possession detection pipeline.
-- `analysis/pauses/`: contains pause detection outputs, including `pause_frame_labels.csv` and `pause_episodes.csv`.
-- `analysis/touches/`: contains possession labels, touch and restart information, and diagnostic/audit files used to inspect the detection results.
-- `analysis/final/`: contains the final output, `final_frame_labels.csv`, together with videos used for visual inspection.
-
-The final prediction is stored in `analysis/final/final_frame_labels.csv`. It contains one label for each video frame and is the file used by the challenge evaluation script.
-
----
-
-## 4. Pipeline Overview
-
-The processing is divided into two main parts:
-
-1. **Pause detection:** identifying periods in which ball is not detected.
-2. **Possession detection:** identifying which team controls the ball during active play.
-
-The outputs of these two processes are then merged into the final frame-level labels.
-
-### 4.1 Pause detection (pauses_analysis.ipynb)
-
-Pause information is obtained from the Smart Tagging data and processed into frame-level labels.
-
-The following distinctions are important:
-
-- `D`: an actual interruption of play. Possession is temporarily suspended.
-- `H`: the home goalkeeper holds the ball.
-- `A`: the away goalkeeper holds the ball.
-- `X`: tracking error or a frame outside the relevant evaluation period.
-
-A goalkeeper holding the ball does **not** mean that play is dead. It is still possession by that goalkeeper's team.
-
-This distinction is essential because pause labels and possession labels describe different aspects of the game.
-
-### 4.2 Possession detection (frame_features.ipynb)
-
-Possession is reconstructed using tracking information and detected touches.
-
-The main principle is to combine several sources of evidence rather than rely on a single indicator.
-
-The pipeline considers:
-
-- Ball position and visibility.
-- Ball speed and direction.
-- Distance between the ball and the nearest player.
-- Team identity of the nearest player.
-- Persistence of player proximity.
-- Detected touch events.
-- The previous possession state.
-
-A detected touch can provide useful evidence, but it is not mandatory. Not every ball touch is detected, so requiring a touch event would cause valid possession changes to be missed.
-
-### 4.3 Restart detection 
-
-A particularly important part of the pipeline is the detection of restarts following a dead-ball interval (`D`).
-
-For each dead-ball interval, the algorithm searches for evidence that play has resumed.
-
-The current tracking-based approach uses:
-
-- A causal ball-speed calculation.
-- A minimum ball-speed threshold.
-- A short observation window.
-- A minimum number of moving frames.
-- Player proximity to the ball.
-- The team identity of nearby players.
-
-Touch events are also considered as supporting evidence.
-
-**Important timing convention:** the possession restart frame is currently set to the first frame immediately after the dead-ball interval:
-
-`restart_frame = D_end + 1` (we have to control if this assumption is good or not)
-
-The tracking evidence may only become sufficiently clear a few frames later. This distinction is intentional: the first frame after `D` determines when possession resumes, while subsequent observations help identify the team.
-
-The team taking the restart is inferred from nearby players and touch information. If the evidence is weak or conflicting, the team assignment should ideally remain unresolved rather than being forced.
-
-### 4.4 Possession state reconstruction
-
-After identifying touches, restarts, goalkeeper holds and dead-ball intervals, the pipeline reconstructs possession over time.
-
-The main events considered are:
-
-- Dead-ball starts.
-- Goalkeeper holds.
-- Restarts.
-- Detected touches.
-
-These events are ordered chronologically and processed through a state-based procedure.
-
-The current implementation also uses a minimum number of touches (2/3?) and a maximum time gap (5/10 sec?) to distinguish meaningful possession sequences from isolated or potentially unreliable touch detections.
-
-Current parameters include:
-
-| Parameter | Current value |
-|---|---:|
-| Minimum touches | 2 |
-| Maximum gap between touches | 10 seconds |
-| Restart ball-speed threshold | 1.0 m/s |
-| Restart movement window | 5 frames |
-| Minimum moving frames | 3 |
-| Player proximity radius | 10 m |
-
-These are working parameters, not necessarily optimal values. They should be tested and validated rather than treated as fixed assumptions.
-
----
-
-## 5. Merging the Labels
-
-The possession and pause outputs are combined into a single frame-level prediction.
-
-The merge procedure follows these rules:
-
-1. Start from the possession labels.
-2. Replace the corresponding frames with pause labels.
-3. Explicitly assign `D` to the second-half pre-kickoff interval.
-4. Assign `X` to any remaining unlabelled frames.
-
-This ensures that pause labels take precedence over possession labels.
-
-The final output is:
-
-`analysis/final/final_frame_labels.csv`
-
-It contains two columns:
-
-- `video_frame`
-- `label`
-
-There should be exactly one row for each of the 199,319 video frames.
-
----
-
-## 6. Evaluation
-
-The pipeline is evaluated using the challenge's public ground-truth labels and the provided evaluation module.
-
-The evaluation considers both frame-level classification and possession-segment reconstruction.
-
-The main metrics currently monitored are:
-
-- **Macro F1:** frame-level classification performance across the label classes.
-- **Spell F1:** quality of the reconstructed possession spells, evaluated using temporal overlap (we are ranked based on this).
-- **Number of predicted possessions:** the number of reconstructed H/A possession segments.
-- **Mean possession duration:** average duration of the predicted possession segments.
-
-
----
-
-## 7. Current Limitations and Potential Improvements
-
-There are several areas where the pipeline can be improved.
-
-### 7.1 Possession changes
-
-The current algorithm sometimes merges consecutive possession spells belonging to different teams.
-
-This is especially problematic when:
-- A possession is very short.
-- A team regains the ball shortly after losing it.
-- A touch is not detected.
-- The ball is temporarily invisible.
-
-A possible improvement is to investigate changes in nearest-player team, ball direction, player movement and ball speed together.
-
-### 7.2 Restart team identification
-
-The identification of the team taking a restart is not always reliable.
-
-Potential improvements include:
-- Using the nearest player's team at the restart.
-- Analysing the direction of ball movement.
-- Considering the attacking direction of each team in each half.
-- Distinguishing the player taking the restart from players who approach the ball afterwards.
-- Avoiding team assignments when the evidence is insufficient.
-
-Absolute ball direction alone is not enough to identify the team. It must be interpreted in relation to each team's attacking direction.
-
-### 7.3 Ball visibility
-
-Since the ball is missing in approximately 43% of frames, the pipeline needs to make better use of player tracking.
-
-Possible improvements:
-- Estimating possession during short periods of ball invisibility.
-- Using player proximity persistence.
-- Analysing player movement and team-level positioning.
-- Avoiding unnecessary switches to unknown possession when the available evidence is still sufficient.
-
-### 7.4 Parameter calibration
-
-The current parameters were selected through experimentation.
-
-They should be tested systematically, particularly:
-- Minimum number of touches.
-- Maximum gap between touches.
-- Ball-speed threshold for restarts.
-- Restart detection window.
-- Player proximity radius.
-- Minimum evidence required for team identification.
-
-Parameter changes should be evaluated against both frame-level and spell-level metrics.
-
-### 7.5 Better error analysis
-
-Rather than focusing only on aggregate metrics, it would be useful to inspect individual possession spells.
-
-The most important questions are:
-- Which ground-truth possessions are completely missed?
-- Which consecutive possessions are incorrectly merged?
-- Are possession boundaries detected too early or too late?
-- Are teams assigned incorrectly?
-- Are errors concentrated around restarts or during normal play?
-
-A frame-by-frame comparison with the ground truth and video is likely to be particularly useful.
-
-
+- **Total Frames:** `199,319` (`frame 0..199318`)
+- **Predicted Label Distribution:**
+  - `D` (Dead Ball): `83,026` (`41.7%`)
+  - `H` (Home Possession): `47,197` (`23.7%`)
+  - `X` (Ungraded / Out of Period): `40,462` (`20.3%`)
+  - `A` (Away Possession): `28,634` (`14.4%`)
+- **Reconstructed Possessions:** `231` spells with a mean duration of `13.1s`.
