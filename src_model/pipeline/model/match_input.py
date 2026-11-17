@@ -1,7 +1,41 @@
+import os
+from dataclasses import dataclass
+
 import numpy as np
 import pandas as pd
+from kloppy import metrica
 
-from dataclasses import dataclass
+import games
+from games import GAME, GAMES, half_video_blocks, require
+from starter.baseline import team_of_each_track
+from src_model.pipeline.model.constants import NO_ANSWER
+from src_model.pipeline.skillcorner.format_data import SkillCornerMatch
+
+DERIVED_DIR = os.path.join(games.DATA_DIR, "derived")
+
+# Which goal (LEFT = x near 0, RIGHT = x near PITCH_LENGTH) each team defends,
+# keyed by (half, team). Hardcoded for this match.
+KEEPER_SIDE = {(1, 0): "LEFT", (1, 1): "RIGHT", (2, 0): "RIGHT", (2, 1): "LEFT"}
+
+
+def load_tracking() -> pd.DataFrame:
+    """
+    The tactical tracking dataframe, one row per frame. Delete the cache if the
+    data changes.
+    """
+    path = os.path.join(DERIVED_DIR, "BAR-ATH_tactical_tracking.pkl")
+    if os.path.exists(path):
+        return pd.read_pickle(path)
+
+    paths = games.asset_paths(source="tactical")
+    meta, raw = paths["atd_meta"], paths["atd_raw"]
+    print(f"Loading tracking from {meta} and {raw}...")
+    df = metrica.load_tracking_epts(meta_data=meta, raw_data=raw).to_df()
+
+    os.makedirs(DERIVED_DIR, exist_ok=True)
+    df.to_pickle(path)
+    return df
+
 
 @dataclass
 class MatchInput:
@@ -14,26 +48,13 @@ class MatchInput:
     graded: np.ndarray              # (n_frames,) frames to predict
     periods: list                   # [(period, first frame, last frame)]
     labels: np.ndarray | None       # (n_frames,) H / A / D / X, None if unknown
-
-# ---------------------------------------------------------------------------
     match_id: int | None = None     # SkillCorner match id; None for BAR-ATH
-
-
-from games import GAME, GAMES, half_video_blocks, require
-from src_rules.pipeline.pauses.constants import KEEPER_SIDE
-from src_rules.utils.data_utils import load_tracking
-from starter.baseline import team_of_each_track
-
-from src_model.pipeline.model.constants import NO_ANSWER
-from src_model.pipeline.skillcorner.format_data import SkillCornerMatch
 
 
 def skillcorner_input(match: SkillCornerMatch) -> MatchInput:
     """A SkillCorner match (already loaded and resampled to 25 fps), with its labels."""
     meta = match.meta
     period = match.tracking["period_id"].to_numpy()
-    # home_side_by_period[p - 1] is "left_to_right" when home attacks towards x
-    # = length in period p
     attacks_right = np.array([side == "left_to_right" for side in meta["home_side_by_period"]])
     labels = match.labels["label"].to_numpy()
     return MatchInput(
@@ -52,12 +73,10 @@ def skillcorner_input(match: SkillCornerMatch) -> MatchInput:
 
 def bar_ath_input() -> MatchInput:
     """Our match. Labels are unknown here; the public ground truth is scored separately."""
-    # Loads the cached dataframe, building it from the gated tracking assets on first use.
     tracking = load_tracking()
     half = np.zeros(len(tracking), dtype=int)
     for h, first, last in half_video_blocks(GAME):
         half[first : last + 1] = h
-    # KEEPER_SIDE gives the goal each team defends; home defending LEFT means attacking right
     defends_left = {h: KEEPER_SIDE[(h, 0)] == "LEFT" for h in (1, 2)}
     length, width = GAMES[GAME]["pitch"]
     return MatchInput(
