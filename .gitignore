@@ -1,0 +1,28 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+env/
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
+
+# Ignore large raw/cached datasets (graders provide these)
+data/broadcast/*
+data/tactical/*
+data/external/*
+data/derived/*
+
+# Explicitly KEEP the trained model and tuning config!
+!data/derived/possession_model_tuning/
+!data/derived/possession_model_tuning/final_model.joblib
+!data/derived/possession_model_tuning/best_config.json
+!data/derived/possession_model_tuning/best_validation_model.joblib
+!data/README.md
